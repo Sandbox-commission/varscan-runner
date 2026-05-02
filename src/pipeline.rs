@@ -1,4 +1,4 @@
-use crate::checkpoint::Dirs;
+use crate::dirs::Dirs;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -48,27 +48,6 @@ impl StepError {
     fn new(step: &str, msg: impl Into<String>) -> Self {
         Self { step: step.to_string(), message: msg.into() }
     }
-}
-
-// ─── Directory setup ──────────────────────────────────────────────────────────
-
-pub fn make_dirs(output_dir: &Path) -> std::io::Result<Dirs> {
-    let dirs = Dirs {
-        flagstats:    output_dir.join("flagstats"),
-        mpileup:      output_dir.join("mpileup"),
-        somatic:      output_dir.join("somatic"),
-        copynumber:   output_dir.join("copynumber"),
-        readcount:    output_dir.join("readcount"),
-        filter_input: output_dir.join("filter-input"),
-    };
-    for d in [
-        &dirs.flagstats, &dirs.mpileup, &dirs.somatic,
-        &dirs.copynumber, &dirs.readcount, &dirs.filter_input,
-    ] {
-        fs::create_dir_all(d)?;
-    }
-    fs::create_dir_all(output_dir.join("filtered"))?;
-    Ok(dirs)
 }
 
 // ─── Stage 1: samtools flagstat ────────────────────────────────────────────────

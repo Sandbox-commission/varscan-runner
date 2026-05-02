@@ -1,3 +1,4 @@
+use crate::dirs::Dirs;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -36,17 +37,6 @@ pub fn step_display(step: &str) -> &'static str {
         STEP_BAM_READCOUNT   => "BAM RC",
         _                    => "Unknown",
     }
-}
-
-// ─── Output directories passed to sha256_step ────────────────────────────────
-
-pub struct Dirs {
-    pub flagstats:    PathBuf,
-    pub mpileup:      PathBuf,
-    pub somatic:      PathBuf,
-    pub copynumber:   PathBuf,
-    pub readcount:    PathBuf,
-    pub filter_input: PathBuf,
 }
 
 // ─── SHA256 helpers ───────────────────────────────────────────────────────────

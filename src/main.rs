@@ -11,15 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod checkpoint;
+mod dirs;
 mod pipeline;
 mod tui;
 
 use checkpoint::{
     invalidate_downstream, is_step_done, sha256_step, step_display, write_checkpoint,
-    Dirs, STEPS_ORDERED,
+    STEPS_ORDERED,
 };
+use dirs::Dirs;
 use pipeline::{
-    make_dirs, run_bam_readcount, run_copycaller, run_copynumber, run_filter_input,
+    run_bam_readcount, run_copycaller, run_copynumber, run_filter_input,
     run_flagstats, run_mpileup, run_process_somatic, run_somatic, Config,
 };
 use tui::{fmt_duration, render, render_final_frame, JobSlotSnapshot, RenderSnapshot};
@@ -351,13 +353,10 @@ fn main() -> ExitCode {
     };
     let n_pairs = pairs.len();
 
-    if let Err(e) = fs::create_dir_all(&cli.output) {
-        eprintln!("ERROR: output dir: {e}"); return ExitCode::FAILURE;
+    let dirs = Arc::new(Dirs::new(&cli.output));
+    if let Err(e) = dirs.create_all() {
+        eprintln!("ERROR: dir setup: {e}"); return ExitCode::FAILURE;
     }
-    let dirs = match make_dirs(&cli.output) {
-        Ok(d)  => Arc::new(d),
-        Err(e) => { eprintln!("ERROR: dir setup: {e}"); return ExitCode::FAILURE; }
-    };
 
     let cfg = Arc::new(Config {
         bam_dir:             cli.bam_dir.canonicalize().unwrap_or(cli.bam_dir),
