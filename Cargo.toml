@@ -1,0 +1,20 @@
+[package]
+name = "varscan-runner"
+version = "1.0.0"
+edition = "2021"
+description = "VarScan2 somatic + CNV pipeline runner with TUI and SHA256 resume"
+
+[[bin]]
+name = "varscan-runner"
+path = "src/main.rs"
+
+[dependencies]
+chrono    = "0.4"
+crossterm = "0.28"
+sha2      = "0.10"
+clap      = { version = "4", features = ["derive"] }
+libc      = "0.2"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
