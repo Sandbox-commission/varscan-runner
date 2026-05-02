@@ -15,14 +15,14 @@ VarScan2 somatic SNV/INDEL + copy number pipeline — resume-aware, parallel, wi
   ████████████████████████░░░░░░░░░░░░░░░░░░░░░  51%
 
   ACTIVE JOBS  (4/8)
-  ┌──────────────────┬────────────┬────────────┬──────┐
-  │ PAIR             │ STAGE      │ PROGRESS   │      │
-  ├──────────────────┼────────────┼────────────┼──────┤
-  │ ⠙ TUMOR1/NORM1  │ VS Somatic │ [████░░░░] │ ~41% │
-  │    00:23 / ~56s  │            │            │      │
-  │ ⠸ TUMOR2/NORM2  │ Mpileup    │ [██░░░░░░] │ ~22% │
-  │    01:12 / ~56s  │            │            │      │
-  └──────────────────┴────────────┴────────────┴──────┘
+  ──────────────────┬────────────┬────────────┬──────
+   PAIR             │ STAGE      │ PROGRESS   │
+  ──────────────────┼────────────┼────────────┼──────
+   ⠙ TUMOR1/NORM1   │ VS Somatic │ [████░░░░] │ ~41%
+      00:23 / ~56s  │            │            │
+   ⠸ TUMOR2/NORM2   │ Mpileup    │ [██░░░░░░] │ ~22%
+      01:12 / ~56s  │            │            │
+  ──────────────────┴────────────┴────────────┴──────
 
   ✓ completed: 3   → resumed: 12   ✗ failed: 0   · remaining: 9
 ```
@@ -296,7 +296,7 @@ The pipeline features a full-screen alternate-screen terminal interface built wi
 - Centered title and subtitle
 - Overall pipeline bar (teal gradient) + stage badge
 - Stage progress bar (blue gradient) with elapsed, ETA, speed, and estimated completion time
-- Per-pair job table with braille spinner, elapsed/ETA, and color-coded progress bar (amber < 25%, teal 25–60%, blue ≥ 60%)
+- Per-pair job table (open-sided, inner column separators only) with braille spinner, elapsed/ETA, and color-coded progress bar (amber < 25%, teal 25–60%, blue ≥ 60%)
 - Color-coded activity log: green (DONE), yellow (SKIP/resumed), red (FAIL), dark red (STOP/cancelled)
 - Sticky footer with cancel hint and last-updated timestamp
 - Resize-safe: clips frame to terminal height preserving header and footer

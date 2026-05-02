@@ -503,15 +503,15 @@ pub fn render(stdout: &mut io::Stdout, snap: &RenderSnapshot, parallel_jobs: usi
     let pc  = lm.pct_col_w;
 
     frame.push(pad_to_width(&format!(
-        "{SEP_DIM}\u{250C}{}\u{252C}{}\u{252C}{}\u{252C}{}\u{2510}{RESET}",
+        "  {SEP_DIM}{}\u{252C}{}\u{252C}{}\u{252C}{}{RESET}",
         "\u{2500}".repeat(sc), "\u{2500}".repeat(stc), "\u{2500}".repeat(bc), "\u{2500}".repeat(pc),
     ), w));
     frame.push(pad_to_width(&format!(
-        "{SEP_DIM}\u{2502}{STATS_GREY}{:<sc$}{SEP_DIM}\u{2502}{STATS_GREY}{:<stc$}{SEP_DIM}\u{2502}{STATS_GREY}{:<bc$}{SEP_DIM}\u{2502}{STATS_GREY}{:>pc$}{SEP_DIM}\u{2502}{RESET}",
+        "  {STATS_GREY}{:<sc$}{SEP_DIM}\u{2502}{STATS_GREY}{:<stc$}{SEP_DIM}\u{2502}{STATS_GREY}{:<bc$}{SEP_DIM}\u{2502}{STATS_GREY}{:>pc$}{RESET}",
         " PAIR", " STAGE", " PROGRESS", " ",
     ), w));
     frame.push(pad_to_width(&format!(
-        "{SEP_DIM}\u{251C}{}\u{253C}{}\u{253C}{}\u{253C}{}\u{2524}{RESET}",
+        "  {SEP_DIM}{}\u{253C}{}\u{253C}{}\u{253C}{}{RESET}",
         "\u{2500}".repeat(sc), "\u{2500}".repeat(stc), "\u{2500}".repeat(bc), "\u{2500}".repeat(pc),
     ), w));
 
@@ -520,7 +520,7 @@ pub fn render(stdout: &mut io::Stdout, snap: &RenderSnapshot, parallel_jobs: usi
 
     if active_jobs.is_empty() {
         let cell = format!("{:<width$}", " No active jobs", width = sc + stc + bc + pc + 3);
-        frame.push(pad_to_width(&format!("{SEP_DIM}\u{2502}{STATS_GREY}{cell}{SEP_DIM}\u{2502}{RESET}"), w));
+        frame.push(pad_to_width(&format!("  {STATS_GREY}{cell}{RESET}"), w));
     }
 
     let rows_below = 7;
@@ -532,7 +532,7 @@ pub fn render(stdout: &mut io::Stdout, snap: &RenderSnapshot, parallel_jobs: usi
             let hidden = active_jobs.len().saturating_sub(shown);
             if hidden > 0 {
                 let cell = format!("{:<width$}", format!(" ... and {hidden} more"), width = sc + stc + bc + pc + 3);
-                frame.push(pad_to_width(&format!("{SEP_DIM}\u{2502}{STATS_GREY}{cell}{SEP_DIM}\u{2502}{RESET}"), w));
+                frame.push(pad_to_width(&format!("  {STATS_GREY}{cell}{RESET}"), w));
             }
             break;
         }
@@ -584,7 +584,7 @@ pub fn render(stdout: &mut io::Stdout, snap: &RenderSnapshot, parallel_jobs: usi
         let pct_cell  = format!("{pct_color}{:>pc$}{RESET}", pct_display);
 
         frame.push(pad_to_width(&format!(
-            "{SEP_DIM}\u{2502}{SPIN_COLOR}{sample_cell}{SEP_DIM}\u{2502}{HDR_BLUE}{step_cell}{SEP_DIM}\u{2502}{bar_cell_padded}{SEP_DIM}\u{2502}{pct_cell}{SEP_DIM}\u{2502}{RESET}",
+            "  {SPIN_COLOR}{sample_cell}{SEP_DIM}\u{2502}{HDR_BLUE}{step_cell}{SEP_DIM}\u{2502}{bar_cell_padded}{SEP_DIM}\u{2502}{pct_cell}{RESET}",
         ), w));
 
         let ela_str = fmt_secs(job.elapsed_secs);
@@ -597,11 +597,11 @@ pub fn render(stdout: &mut io::Stdout, snap: &RenderSnapshot, parallel_jobs: usi
         } else { ela_str };
         let inner_w = sc + stc + bc + pc + 3;
         let ela_cell = format!("{:<inner_w$}", format!("    {eta_part}"));
-        frame.push(pad_to_width(&format!("{SEP_DIM}\u{2502}{STATS_GREY}{ela_cell}{SEP_DIM}\u{2502}{RESET}"), w));
+        frame.push(pad_to_width(&format!("  {STATS_GREY}{ela_cell}{RESET}"), w));
     }
 
     frame.push(pad_to_width(&format!(
-        "{SEP_DIM}\u{2514}{}\u{2534}{}\u{2534}{}\u{2534}{}\u{2518}{RESET}",
+        "  {SEP_DIM}{}\u{2534}{}\u{2534}{}\u{2534}{}{RESET}",
         "\u{2500}".repeat(sc), "\u{2500}".repeat(stc), "\u{2500}".repeat(bc), "\u{2500}".repeat(pc),
     ), w));
 

@@ -16,8 +16,9 @@ mod pipeline;
 mod tui;
 
 use checkpoint::{
-    check_resume_all_parallel, invalidate_downstream, is_step_done, sha256_step,
-    step_display, write_checkpoint, STEPS_ORDERED,
+    check_resume_all_parallel, compute_checkpoint, invalidate_downstream,
+    pending_checkpoint, pre_run_cleanup, step_display, step_output_size, upgrade_checkpoint,
+    write_checkpoint, ResumeStatus, STEPS_ORDERED,
 };
 use dirs::Dirs;
 use pipeline::{
@@ -27,6 +28,20 @@ use pipeline::{
 use tui::{fmt_duration, render, render_final_frame, JobSlotSnapshot, RenderSnapshot};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+// ─── SHA worker pool ──────────────────────────────────────────────────────────
+
+// Steps whose total output exceeds this threshold get deferred SHA computation.
+const SHA_INLINE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100 MB
+
+struct ShaJob {
+    output_dir: PathBuf,
+    pair_id:    String,
+    step:       &'static str,
+    dirs:       Arc<Dirs>,
+    normal:     String,
+    tumor:      String,
+}
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -299,21 +314,33 @@ fn assemble_snapshot(state: &Arc<State>, n_workers: usize) -> RenderSnapshot {
 // ─── Pair worker ──────────────────────────────────────────────────────────────
 
 fn process_pair(
-    pair:       &Pair,
-    slot_idx:   usize,
-    cfg:        &Config,
-    dirs:       &Dirs,
-    state:      &Arc<State>,
-    pair_start: Instant,
+    pair:        &Pair,
+    slot_idx:    usize,
+    cfg:         &Config,
+    dirs:        &Dirs,
+    state:       &Arc<State>,
+    sha_queue:   &Arc<Mutex<VecDeque<ShaJob>>>,
+    resume_from: usize,
+    pair_start:  Instant,
 ) {
     let pid = &pair.pair_id;
     let n   = &*pair.normal;
     let t   = &*pair.tumor;
 
     let mut local_run    = 0usize;
-    let mut local_cached = 0usize;
+    let local_cached = resume_from;   // pre-verified stages counted upfront
 
-    for &step in STEPS_ORDERED {
+    // Credit pre-verified stages to global counters immediately
+    for i in 0..resume_from {
+        let step = STEPS_ORDERED[i];
+        state.stages_done.fetch_add(1, Ordering::Relaxed);
+        state.stages_resumed.fetch_add(1, Ordering::Relaxed);
+        push_event(state, format!("SKIP  {pid} — {} (pre-verified)", step_display(step)));
+    }
+
+    for (i, &step) in STEPS_ORDERED.iter().enumerate() {
+        if i < resume_from { continue; }
+
         if CANCELLED.load(Ordering::Relaxed) {
             let elapsed = pair_start.elapsed().as_secs_f64();
             state.pair_results.lock().unwrap_or_else(|e| e.into_inner())
@@ -336,14 +363,6 @@ fn process_pair(
             });
         }
 
-        if is_step_done(&cfg.output_dir, pid, step, dirs, n, t) {
-            state.stages_done.fetch_add(1, Ordering::Relaxed);
-            state.stages_resumed.fetch_add(1, Ordering::Relaxed);
-            local_cached += 1;
-            push_event(state, format!("SKIP  {pid} — {} (SHA256 match)", step_display(step)));
-            continue;
-        }
-
         invalidate_downstream(&cfg.output_dir, pid, step);
 
         let result: Result<(), String> = match step {
@@ -360,8 +379,23 @@ fn process_pair(
 
         match result {
             Ok(()) => {
-                let digest = sha256_step(dirs, n, t, step);
-                let _ = write_checkpoint(&cfg.output_dir, pid, step, &digest);
+                let out_size = step_output_size(dirs, n, t, step);
+                if out_size <= SHA_INLINE_THRESHOLD {
+                    let ckpt = compute_checkpoint(dirs, n, t, step);
+                    let _ = write_checkpoint(&cfg.output_dir, pid, step, &ckpt);
+                } else {
+                    let _ = write_checkpoint(&cfg.output_dir, pid, step,
+                        &pending_checkpoint(dirs, n, t, step));
+                    sha_queue.lock().unwrap_or_else(|e| e.into_inner())
+                        .push_back(ShaJob {
+                            output_dir: cfg.output_dir.clone(),
+                            pair_id:    pid.clone(),
+                            step,
+                            dirs:       Arc::new(dirs.clone()),
+                            normal:     n.to_string(),
+                            tumor:      t.to_string(),
+                        });
+                }
                 state.stages_done.fetch_add(1, Ordering::Relaxed);
                 local_run += 1;
                 push_event(state, format!("DONE  {pid} — {}", step_display(step)));
@@ -561,38 +595,42 @@ fn main() -> ExitCode {
     let pair_triples: Vec<(String, String, String)> = pairs.iter()
         .map(|p| (p.pair_id.clone(), p.normal.clone(), p.tumor.clone()))
         .collect();
-    let resume_states = check_resume_all_parallel(&output_canon, &pair_triples, &dirs);
+    let resume_results = check_resume_all_parallel(&output_canon, &pair_triples, &dirs);
+    let resume_map: std::collections::HashMap<String, ResumeStatus> =
+        resume_results.into_iter().collect();
 
-    let (n_complete, n_partial, n_fresh) = resume_states.iter().fold((0usize, 0usize, 0usize),
-        |acc, (_, r)| {
-            if r.is_all_done()  { (acc.0 + 1, acc.1,     acc.2    ) }
-            else if r.is_fresh(){ (acc.0,     acc.1,     acc.2 + 1) }
-            else                { (acc.0,     acc.1 + 1, acc.2    ) }
+    let (n_complete, n_partial, n_fresh) = pairs.iter().fold((0usize, 0usize, 0usize),
+        |acc, p| match resume_map.get(&p.pair_id) {
+            Some(r) if r.is_all_done()  => (acc.0 + 1, acc.1,     acc.2    ),
+            Some(r) if r.is_fresh()     => (acc.0,     acc.1,     acc.2 + 1),
+            None                        => (acc.0,     acc.1,     acc.2 + 1),
+            _                           => (acc.0,     acc.1 + 1, acc.2    ),
         });
     eprintln!("Resume scan: {n_pairs} pairs — {n_complete} complete, {n_partial} partial, {n_fresh} fresh");
 
     // ── Dry-run ──
     if cli.dry_run {
-        let col_pair  = 42usize;
-        let col_sta   = 10usize;
-        let col_stg   = 8usize;
+        let col_pair = 42usize;
+        let col_sta  = 10usize;
+        let col_stg  = 8usize;
         eprintln!();
         eprintln!("  {:<col_pair$}  {:<col_sta$}  {:<col_stg$}  Note",
             "Pair", "Status", "Stages");
         eprintln!("  {}", "─".repeat(col_pair + col_sta + col_stg + 30));
-        for (pair, (_, rs)) in pairs.iter().zip(resume_states.iter()) {
-            let status = if rs.is_all_done()  { "COMPLETE" }
-                else if rs.is_fresh()         { "FRESH"    }
-                else                          { "PARTIAL"  };
-            let note = if rs.is_all_done() {
-                "will be skipped".to_string()
-            } else if rs.is_fresh() {
-                "will run all stages".to_string()
-            } else {
-                format!("resumes from stage {}", rs.cached + 1)
+        for pair in &pairs {
+            let rs = resume_map.get(&pair.pair_id)
+                .cloned()
+                .unwrap_or(ResumeStatus::NotDone);
+            let cached = rs.cached_count();
+            let total  = STEPS_ORDERED.len();
+            let note   = match &rs {
+                ResumeStatus::AllDone      => "will be skipped".to_string(),
+                ResumeStatus::NotDone      => "will run all stages".to_string(),
+                ResumeStatus::FromStep(n)  =>
+                    format!("resumes from stage {} ({})", n + 1, step_display(STEPS_ORDERED[*n])),
             };
             eprintln!("  {:<col_pair$}  {:<col_sta$}  {}/{:<5}  {}",
-                pair.pair_id, status, rs.cached, rs.total, note);
+                pair.pair_id, rs.display_status(), cached, total, note);
         }
         eprintln!();
         eprintln!("  Use without --dry-run to execute.");
@@ -607,9 +645,27 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // ── Pre-dispatch routing: pre-emptive cleanup + upfront summary ──
+    let annotated_pairs: VecDeque<(Pair, usize)> = pairs.iter().map(|pair| {
+        let rs   = resume_map.get(&pair.pair_id).cloned().unwrap_or(ResumeStatus::NotDone);
+        let from = rs.resume_from();
+        if from < STEPS_ORDERED.len() {
+            pre_run_cleanup(&output_canon, &pair.pair_id, from, &dirs, &pair.normal, &pair.tumor);
+            match &rs {
+                ResumeStatus::NotDone =>
+                    eprintln!("  FRESH   {} — all {} stages", pair.pair_id, STEPS_ORDERED.len()),
+                ResumeStatus::FromStep(n) =>
+                    eprintln!("  RESUME  {} — {} cached, rerunning from {} ({})",
+                        pair.pair_id, n, n + 1, step_display(STEPS_ORDERED[*n])),
+                ResumeStatus::AllDone => {}
+            }
+        }
+        (pair.clone(), from)
+    }).collect();
+
     let n_workers = cli.jobs.max(1).min(n_pairs);
     let state     = Arc::new(State::new(n_pairs, n_workers));
-    let queue     = Arc::new(Mutex::new(pairs));
+    let queue     = Arc::new(Mutex::new(annotated_pairs));
     let active    = Arc::new(AtomicUsize::new(n_workers));
 
     // ── TUI + signal setup ──
@@ -624,23 +680,48 @@ fn main() -> ExitCode {
         None
     };
 
+    // ── SHA worker pool ──
+    let sha_queue: Arc<Mutex<VecDeque<ShaJob>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let sha_done  = Arc::new(AtomicBool::new(false));
+    let n_sha     = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(4);
+    let sha_handles: Vec<_> = (0..n_sha).map(|_| {
+        let q    = Arc::clone(&sha_queue);
+        let done = Arc::clone(&sha_done);
+        std::thread::spawn(move || loop {
+            let job = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            match job {
+                Some(j) => upgrade_checkpoint(
+                    &j.output_dir, &j.pair_id, j.step, &j.dirs, &j.normal, &j.tumor,
+                ),
+                None => {
+                    if done.load(Ordering::Relaxed) { break; }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        })
+    }).collect();
+
     // ── Spawn workers ──
     let handles: Vec<_> = (0..n_workers).map(|slot_idx| {
-        let queue  = Arc::clone(&queue);
-        let state  = Arc::clone(&state);
-        let cfg    = Arc::clone(&cfg);
-        let dirs   = Arc::clone(&dirs);
-        let active = Arc::clone(&active);
+        let queue     = Arc::clone(&queue);
+        let state     = Arc::clone(&state);
+        let cfg       = Arc::clone(&cfg);
+        let dirs      = Arc::clone(&dirs);
+        let active    = Arc::clone(&active);
+        let sha_queue = Arc::clone(&sha_queue);
         std::thread::spawn(move || {
             loop {
                 if CANCELLED.load(Ordering::Relaxed) { break; }
-                let pair = {
+                let item = {
                     let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-                    if q.is_empty() { break; }
-                    q.remove(0)
+                    q.pop_front()
                 };
+                let Some((pair, resume_from)) = item else { break };
                 let t0 = Instant::now();
-                process_pair(&pair, slot_idx, &cfg, &dirs, &state, t0);
+                process_pair(&pair, slot_idx, &cfg, &dirs, &state, &sha_queue, resume_from, t0);
             }
             active.fetch_sub(1, Ordering::Relaxed);
         })
@@ -655,12 +736,10 @@ fn main() -> ExitCode {
         if last_b.elapsed() >= Duration::from_millis(500) { blink = !blink; last_b = Instant::now(); }
 
         if is_tty {
-            let snap = assemble_snapshot(&state, n_workers);
-            render(&mut stdout, &snap, n_workers, blink);
-
-            if event::poll(Duration::ZERO).unwrap_or(false) {
-                if let Ok(event::Event::Key(k)) = event::read() {
-                    match k.code {
+            let mut force_clear = false;
+            while event::poll(Duration::ZERO).unwrap_or(false) {
+                match event::read() {
+                    Ok(event::Event::Key(k)) => match k.code {
                         event::KeyCode::Char('q') | event::KeyCode::Char('Q') => {
                             CANCELLED.store(true, Ordering::Relaxed);
                         }
@@ -670,14 +749,31 @@ fn main() -> ExitCode {
                             CANCELLED.store(true, Ordering::Relaxed);
                         }
                         _ => {}
-                    }
+                    },
+                    Ok(event::Event::Resize(_, _)) => { force_clear = true; }
+                    _ => {}
                 }
             }
+            if force_clear {
+                let mut clr = Vec::new();
+                let _ = crossterm::queue!(
+                    clr,
+                    terminal::Clear(terminal::ClearType::All),
+                    cursor::MoveTo(0, 0)
+                );
+                let _ = stdout.write_all(&clr);
+            }
+            let snap = assemble_snapshot(&state, n_workers);
+            render(&mut stdout, &snap, n_workers, blink);
         }
         std::thread::sleep(refresh);
     }
 
     for h in handles { h.join().ok(); }
+
+    // ── Drain remaining SHA jobs then shut down SHA pool ──
+    sha_done.store(true, Ordering::Relaxed);
+    for h in sha_handles { h.join().ok(); }
 
     // ── Write summary TSV ──
     let results = state.pair_results.lock().unwrap_or_else(|e| e.into_inner()).clone();
