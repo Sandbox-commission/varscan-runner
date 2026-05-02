@@ -42,7 +42,7 @@ BAM files must be **coordinate-sorted** and **indexed** (`*.bam` + `*.bai`), nam
 ## Build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/varscan-runner
+git clone https://github.com/Sandbox-commission/varscan-runner
 cd varscan-runner
 cargo build --release
 # Binary: ./target/release/varscan-runner
