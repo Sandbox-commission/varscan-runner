@@ -2,6 +2,8 @@ use crate::dirs::Dirs;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ─── Stage constants ──────────────────────────────────────────────────────────
 
@@ -170,4 +172,82 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path).inspect_err(|_| { let _ = fs::remove_file(&tmp); })
+}
+
+// ─── Pre-run resume state ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub struct ResumeState {
+    /// Consecutive steps from the front of STEPS_ORDERED with valid SHA256 checkpoints.
+    pub cached: usize,
+    /// Always STEPS_ORDERED.len().
+    pub total:  usize,
+}
+
+impl ResumeState {
+    pub fn is_all_done(self) -> bool { self.cached == self.total }
+    pub fn is_fresh(self)    -> bool { self.cached == 0 }
+}
+
+pub fn check_resume(
+    base:    &Path,
+    pair_id: &str,
+    normal:  &str,
+    tumor:   &str,
+    dirs:    &Dirs,
+) -> ResumeState {
+    let mut cached = 0;
+    for &step in STEPS_ORDERED {
+        if is_step_done(base, pair_id, step, dirs, normal, tumor) {
+            cached += 1;
+        } else {
+            break;
+        }
+    }
+    ResumeState { cached, total: STEPS_ORDERED.len() }
+}
+
+/// Check resume state for all pairs in parallel (up to 16 threads).
+/// Returns results in the same order as the input slice.
+pub fn check_resume_all_parallel(
+    base:  &Path,
+    pairs: &[(String, String, String)],   // (pair_id, normal, tumor)
+    dirs:  &Dirs,
+) -> Vec<(String, ResumeState)> {
+    let n         = pairs.len();
+    let n_threads = n.min(16).max(1);
+    let results   = Arc::new(Mutex::new(Vec::<(String, ResumeState)>::with_capacity(n)));
+    let next      = Arc::new(AtomicUsize::new(0));
+    let pairs_arc = Arc::new(pairs.to_vec());
+    let base_arc  = Arc::new(base.to_path_buf());
+    let dirs_arc  = Arc::new(dirs.clone());
+
+    let handles: Vec<_> = (0..n_threads).map(|_| {
+        let results = Arc::clone(&results);
+        let next    = Arc::clone(&next);
+        let pairs   = Arc::clone(&pairs_arc);
+        let base    = Arc::clone(&base_arc);
+        let dirs    = Arc::clone(&dirs_arc);
+        std::thread::spawn(move || loop {
+            let idx = next.fetch_add(1, Ordering::Relaxed);
+            if idx >= pairs.len() { break; }
+            let (ref pid, ref norm, ref tum) = pairs[idx];
+            let state = check_resume(&base, pid, norm, tum, &dirs);
+            results.lock().unwrap_or_else(|e| e.into_inner())
+                .push((pid.clone(), state));
+        })
+    }).collect();
+
+    for h in handles {
+        if h.join().is_err() {
+            eprintln!("Warning: resume-check thread panicked — affected pairs will reprocess");
+        }
+    }
+
+    let mut out: Vec<(String, ResumeState)> =
+        results.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let order: std::collections::HashMap<&str, usize> =
+        pairs.iter().enumerate().map(|(i, (pid, _, _))| (pid.as_str(), i)).collect();
+    out.sort_by_key(|(pid, _)| order.get(pid.as_str()).copied().unwrap_or(usize::MAX));
+    out
 }

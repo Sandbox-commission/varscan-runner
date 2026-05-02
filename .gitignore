@@ -13,3 +13,4 @@ Cargo.lock
 *.readcount
 *.var
 varscan_analysis_summary.txt
+varscan_pipeline_summary.tsv

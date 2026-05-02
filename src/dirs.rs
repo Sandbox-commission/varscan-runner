@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 // ─── Output directory set ─────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct Dirs {
     pub base:         PathBuf,
     pub flagstats:    PathBuf,

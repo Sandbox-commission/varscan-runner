@@ -3,9 +3,9 @@ use clap::Parser;
 use crossterm::{cursor, event, execute, style, terminal, tty::IsTty};
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,8 +16,8 @@ mod pipeline;
 mod tui;
 
 use checkpoint::{
-    invalidate_downstream, is_step_done, sha256_step, step_display, write_checkpoint,
-    STEPS_ORDERED,
+    check_resume_all_parallel, invalidate_downstream, is_step_done, sha256_step,
+    step_display, write_checkpoint, STEPS_ORDERED,
 };
 use dirs::Dirs;
 use pipeline::{
@@ -54,38 +54,106 @@ struct Cli {
     genome: PathBuf,
 
     /// Path to VarScan jar
-    #[arg(long, default_value = "/home/gifthr/software/VarScan.v2.3.9.jar")]
+    #[arg(long)]
     varscan: PathBuf,
 
-    #[arg(long, default_value = "java")]        java:          String,
-    #[arg(long, default_value = "24g")]         java_mem:      String,
-    #[arg(long, default_value = "samtools")]    samtools:      String,
-    #[arg(long, default_value = "bam-readcount")] bam_readcount: String,
+    /// java binary path
+    #[arg(long, default_value = "java")]
+    java: String,
 
-    /// Parallel pairs
+    /// Java heap size for VarScan (e.g. 24g, 48g)
+    #[arg(long, default_value = "24g")]
+    java_mem: String,
+
+    /// samtools binary path
+    #[arg(long, default_value = "samtools")]
+    samtools: String,
+
+    /// bam-readcount binary path
+    #[arg(long, default_value = "bam-readcount")]
+    bam_readcount: String,
+
+    /// Number of tumor–normal pairs to process in parallel
     #[arg(short, long, default_value_t = 8)]
     jobs: usize,
 
-    // ── VarScan somatic ──
-    #[arg(long, default_value_t = 10)]    min_coverage:         u32,
-    #[arg(long, default_value_t = 10)]    min_coverage_normal:  u32,
-    #[arg(long, default_value_t = 15)]    min_coverage_tumor:   u32,
-    #[arg(long, default_value_t = 0.08)]  min_var_freq:         f64,
-    #[arg(long, default_value_t = 0.75)]  min_freq_for_hom:     f64,
-    #[arg(long, default_value_t = 1.0)]   normal_purity:        f64,
-    #[arg(long, default_value_t = 1.0)]   tumor_purity:         f64,
-    #[arg(long, default_value_t = 0.99)]  p_value:              f64,
-    #[arg(long, default_value_t = 0.05)]  somatic_p_value:      f64,
-    #[arg(long, default_value_t = 0.10)]  min_tumor_freq:       f64,
-    #[arg(long, default_value_t = 0.05)]  max_normal_freq:      f64,
-    #[arg(long, default_value_t = 0.07)]  process_p_value:      f64,
-    // ── VarScan copynumber ──
-    #[arg(long, default_value_t = 10)]    cnv_min_coverage:     u32,
-    #[arg(long, default_value_t = 20)]    min_segment_size:     u32,
-    #[arg(long, default_value_t = 100)]   max_segment_size:     u32,
-    #[arg(long, default_value_t = 0.005)] cnv_p_value:          f64,
-    // ── samtools ──
-    #[arg(long, default_value_t = 20)]    mpileup_mapq:         u32,
+    /// List pairs and resume status without running anything
+    #[arg(long)]
+    dry_run: bool,
+
+    // ── VarScan somatic ─────────────────────────────────────────────────────────
+
+    /// Minimum read depth across both samples to call a variant
+    #[arg(long, default_value_t = 10)]
+    min_coverage: u32,
+
+    /// Minimum read depth in the normal sample
+    #[arg(long, default_value_t = 10)]
+    min_coverage_normal: u32,
+
+    /// Minimum read depth in the tumor sample
+    #[arg(long, default_value_t = 15)]
+    min_coverage_tumor: u32,
+
+    /// Minimum variant allele frequency to report a variant
+    #[arg(long, default_value_t = 0.08)]
+    min_var_freq: f64,
+
+    /// Minimum allele frequency to call homozygous
+    #[arg(long, default_value_t = 0.75)]
+    min_freq_for_hom: f64,
+
+    /// Estimated normal sample purity (1.0 = pure normal)
+    #[arg(long, default_value_t = 1.0)]
+    normal_purity: f64,
+
+    /// Estimated tumor sample purity (1.0 = pure tumor)
+    #[arg(long, default_value_t = 1.0)]
+    tumor_purity: f64,
+
+    /// p-value threshold for calling a variant (somatic/germline/LOH classification)
+    #[arg(long, default_value_t = 0.99)]
+    p_value: f64,
+
+    /// p-value threshold for somatic classification (TCGA recommendation: 0.05)
+    #[arg(long, default_value_t = 0.05)]
+    somatic_p_value: f64,
+
+    /// Minimum tumor VAF to retain in processSomatic high-confidence filter
+    #[arg(long, default_value_t = 0.10)]
+    min_tumor_freq: f64,
+
+    /// Maximum normal VAF allowed in processSomatic high-confidence filter
+    #[arg(long, default_value_t = 0.05)]
+    max_normal_freq: f64,
+
+    /// p-value threshold for processSomatic high-confidence filter
+    #[arg(long, default_value_t = 0.07)]
+    process_p_value: f64,
+
+    // ── VarScan copynumber ───────────────────────────────────────────────────────
+
+    /// Minimum read depth for copy number analysis
+    #[arg(long, default_value_t = 10)]
+    cnv_min_coverage: u32,
+
+    /// Minimum segment size (windows) for copy number calls
+    #[arg(long, default_value_t = 20)]
+    min_segment_size: u32,
+
+    /// Maximum segment size (windows) for copy number calls
+    #[arg(long, default_value_t = 100)]
+    max_segment_size: u32,
+
+    /// p-value threshold for copy number segment calling
+    #[arg(long, default_value_t = 0.005)]
+    cnv_p_value: f64,
+
+    // ── samtools mpileup ─────────────────────────────────────────────────────────
+
+    /// Minimum mapping quality for samtools mpileup (-q)
+    #[arg(long, default_value_t = 20)]
+    mpileup_mapq: u32,
 }
 
 // ─── Sample pair ──────────────────────────────────────────────────────────────
@@ -95,6 +163,19 @@ struct Pair {
     normal:  String,
     tumor:   String,
     pair_id: String,
+}
+
+// ─── Per-pair run summary ─────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct PairSummary {
+    pair_id:      String,
+    normal:       String,
+    tumor:        String,
+    status:       &'static str,   // "complete" | "failed" | "cancelled" | "skipped"
+    stages_run:   usize,
+    stages_cached: usize,
+    duration_s:   f64,
 }
 
 // ─── Shared TUI state ─────────────────────────────────────────────────────────
@@ -108,6 +189,7 @@ struct State {
     slots:          Mutex<Vec<Option<SlotInfo>>>,
     events:         Mutex<VecDeque<String>>,
     pair_durations: Mutex<Vec<f64>>,
+    pair_results:   Mutex<Vec<PairSummary>>,
     start:          Instant,
     n_pairs:        usize,
 }
@@ -130,6 +212,7 @@ impl State {
             slots:          Mutex::new(vec![None; n_workers]),
             events:         Mutex::new(VecDeque::with_capacity(64)),
             pair_durations: Mutex::new(Vec::new()),
+            pair_results:   Mutex::new(Vec::with_capacity(n_pairs)),
             start:          Instant::now(),
             n_pairs,
         }
@@ -188,7 +271,7 @@ fn assemble_snapshot(state: &Arc<State>, n_workers: usize) -> RenderSnapshot {
         })
     }).collect();
 
-    let _ = n_workers; // used for slot Vec size
+    let _ = n_workers;
 
     RenderSnapshot {
         done:                 pairs_done,
@@ -227,10 +310,23 @@ fn process_pair(
     let n   = &*pair.normal;
     let t   = &*pair.tumor;
 
-    for &step in STEPS_ORDERED {
-        if CANCELLED.load(Ordering::Relaxed) { break; }
+    let mut local_run    = 0usize;
+    let mut local_cached = 0usize;
 
-        // Update active slot
+    for &step in STEPS_ORDERED {
+        if CANCELLED.load(Ordering::Relaxed) {
+            let elapsed = pair_start.elapsed().as_secs_f64();
+            state.pair_results.lock().unwrap_or_else(|e| e.into_inner())
+                .push(PairSummary {
+                    pair_id: pid.clone(), normal: n.to_string(), tumor: t.to_string(),
+                    status: "cancelled", stages_run: local_run, stages_cached: local_cached,
+                    duration_s: elapsed,
+                });
+            let mut slots = state.slots.lock().unwrap_or_else(|e| e.into_inner());
+            slots[slot_idx] = None;
+            return;
+        }
+
         {
             let mut slots = state.slots.lock().unwrap_or_else(|e| e.into_inner());
             slots[slot_idx] = Some(SlotInfo {
@@ -240,15 +336,14 @@ fn process_pair(
             });
         }
 
-        // SHA256 resume check
         if is_step_done(&cfg.output_dir, pid, step, dirs, n, t) {
             state.stages_done.fetch_add(1, Ordering::Relaxed);
             state.stages_resumed.fetch_add(1, Ordering::Relaxed);
+            local_cached += 1;
             push_event(state, format!("SKIP  {pid} — {} (SHA256 match)", step_display(step)));
             continue;
         }
 
-        // Invalidate downstream checkpoints before re-running
         invalidate_downstream(&cfg.output_dir, pid, step);
 
         let result: Result<(), String> = match step {
@@ -268,11 +363,19 @@ fn process_pair(
                 let digest = sha256_step(dirs, n, t, step);
                 let _ = write_checkpoint(&cfg.output_dir, pid, step, &digest);
                 state.stages_done.fetch_add(1, Ordering::Relaxed);
+                local_run += 1;
                 push_event(state, format!("DONE  {pid} — {}", step_display(step)));
             }
             Err(msg) => {
                 push_event(state, format!("FAIL  {pid} — {}: {msg}", step_display(step)));
                 state.pairs_failed.fetch_add(1, Ordering::Relaxed);
+                let elapsed = pair_start.elapsed().as_secs_f64();
+                state.pair_results.lock().unwrap_or_else(|e| e.into_inner())
+                    .push(PairSummary {
+                        pair_id: pid.clone(), normal: n.to_string(), tumor: t.to_string(),
+                        status: "failed", stages_run: local_run, stages_cached: local_cached,
+                        duration_s: elapsed,
+                    });
                 let mut slots = state.slots.lock().unwrap_or_else(|e| e.into_inner());
                 slots[slot_idx] = None;
                 return;
@@ -283,6 +386,15 @@ fn process_pair(
     let elapsed = pair_start.elapsed().as_secs_f64();
     state.pairs_done.fetch_add(1, Ordering::Relaxed);
     state.pair_durations.lock().unwrap_or_else(|e| e.into_inner()).push(elapsed);
+
+    let status = if local_run == 0 { "skipped" } else { "complete" };
+    state.pair_results.lock().unwrap_or_else(|e| e.into_inner())
+        .push(PairSummary {
+            pair_id: pid.clone(), normal: n.to_string(), tumor: t.to_string(),
+            status, stages_run: local_run, stages_cached: local_cached,
+            duration_s: elapsed,
+        });
+
     push_event(state, format!("DONE  {pid} — complete ({:.0}s)", elapsed));
 
     let mut slots = state.slots.lock().unwrap_or_else(|e| e.into_inner());
@@ -316,6 +428,58 @@ fn parse_pairs(path: &std::path::Path) -> Result<Vec<Pair>, String> {
     Ok(pairs)
 }
 
+// ─── Preflight ────────────────────────────────────────────────────────────────
+
+fn can_spawn(bin: &str, args: &[&str]) -> bool {
+    std::process::Command::new(bin)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn preflight(cfg: &Config) -> Vec<String> {
+    let mut errs = Vec::new();
+
+    if !can_spawn(&cfg.samtools, &["--version"]) {
+        errs.push(format!("samtools not found or not executable: {:?}\n  Fix: apt install samtools  OR  --samtools /path/to/samtools", cfg.samtools));
+    }
+    if !can_spawn(&cfg.java, &["-version"]) {
+        errs.push(format!("java not found or not executable: {:?}\n  Fix: install Java ≥11  OR  --java /path/to/java", cfg.java));
+    }
+    if !cfg.varscan_jar.exists() {
+        errs.push(format!("VarScan jar not found: {}\n  Fix: download VarScan2  OR  --varscan /path/to/VarScan.jar", cfg.varscan_jar.display()));
+    }
+    if !can_spawn(&cfg.bam_readcount_bin, &[]) {
+        errs.push(format!("bam-readcount not found or not executable: {:?}\n  Fix: conda install -c bioconda bam-readcount  OR  --bam-readcount /path/to/bam-readcount", cfg.bam_readcount_bin));
+    }
+    if !cfg.genome.exists() {
+        errs.push(format!("Reference genome not found: {}", cfg.genome.display()));
+    }
+    if !cfg.bam_dir.exists() {
+        errs.push(format!("BAM directory not found: {}", cfg.bam_dir.display()));
+    }
+    errs
+}
+
+// ─── Summary TSV ─────────────────────────────────────────────────────────────
+
+fn write_summary(results: &[PairSummary], output_dir: &std::path::Path) {
+    let path = output_dir.join("varscan_pipeline_summary.tsv");
+    let mut buf = String::from("pair_id\tnormal\ttumor\tstatus\tstages_run\tstages_cached\tduration_s\n");
+    for r in results {
+        buf.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\n",
+            r.pair_id, r.normal, r.tumor,
+            r.status, r.stages_run, r.stages_cached, r.duration_s,
+        ));
+    }
+    if let Ok(mut f) = fs::File::create(&path) {
+        let _ = f.write_all(buf.as_bytes());
+    }
+}
+
 // ─── SIGINT → CANCELLED ───────────────────────────────────────────────────────
 
 fn install_sigint_handler() {
@@ -331,7 +495,7 @@ fn install_sigint_handler() {
     }
 }
 
-// ─── Terminal guard (restores on drop) ───────────────────────────────────────
+// ─── Terminal guard ───────────────────────────────────────────────────────────
 
 struct TermGuard;
 impl Drop for TermGuard {
@@ -353,14 +517,21 @@ fn main() -> ExitCode {
     };
     let n_pairs = pairs.len();
 
-    let dirs = Arc::new(Dirs::new(&cli.output));
+    // Create base output dir then canonicalize for stable absolute paths
+    if let Err(e) = fs::create_dir_all(&cli.output) {
+        eprintln!("ERROR: output dir: {e}"); return ExitCode::FAILURE;
+    }
+    let output_canon = cli.output.canonicalize().unwrap_or_else(|_| cli.output.clone());
+
+    let dirs = Arc::new(Dirs::new(&output_canon));
     if let Err(e) = dirs.create_all() {
         eprintln!("ERROR: dir setup: {e}"); return ExitCode::FAILURE;
     }
 
+    let bam_dir_canon = cli.bam_dir.canonicalize().unwrap_or_else(|_| cli.bam_dir.clone());
     let cfg = Arc::new(Config {
-        bam_dir:             cli.bam_dir.canonicalize().unwrap_or(cli.bam_dir),
-        output_dir:          cli.output.canonicalize().unwrap_or(cli.output),
+        bam_dir:             bam_dir_canon,
+        output_dir:          output_canon.clone(),
         genome:              cli.genome,
         varscan_jar:         cli.varscan,
         java:                cli.java,
@@ -386,6 +557,56 @@ fn main() -> ExitCode {
         mpileup_mapq:        cli.mpileup_mapq,
     });
 
+    // ── Pre-run resume scan ──
+    let pair_triples: Vec<(String, String, String)> = pairs.iter()
+        .map(|p| (p.pair_id.clone(), p.normal.clone(), p.tumor.clone()))
+        .collect();
+    let resume_states = check_resume_all_parallel(&output_canon, &pair_triples, &dirs);
+
+    let (n_complete, n_partial, n_fresh) = resume_states.iter().fold((0usize, 0usize, 0usize),
+        |acc, (_, r)| {
+            if r.is_all_done()  { (acc.0 + 1, acc.1,     acc.2    ) }
+            else if r.is_fresh(){ (acc.0,     acc.1,     acc.2 + 1) }
+            else                { (acc.0,     acc.1 + 1, acc.2    ) }
+        });
+    eprintln!("Resume scan: {n_pairs} pairs — {n_complete} complete, {n_partial} partial, {n_fresh} fresh");
+
+    // ── Dry-run ──
+    if cli.dry_run {
+        let col_pair  = 42usize;
+        let col_sta   = 10usize;
+        let col_stg   = 8usize;
+        eprintln!();
+        eprintln!("  {:<col_pair$}  {:<col_sta$}  {:<col_stg$}  Note",
+            "Pair", "Status", "Stages");
+        eprintln!("  {}", "─".repeat(col_pair + col_sta + col_stg + 30));
+        for (pair, (_, rs)) in pairs.iter().zip(resume_states.iter()) {
+            let status = if rs.is_all_done()  { "COMPLETE" }
+                else if rs.is_fresh()         { "FRESH"    }
+                else                          { "PARTIAL"  };
+            let note = if rs.is_all_done() {
+                "will be skipped".to_string()
+            } else if rs.is_fresh() {
+                "will run all stages".to_string()
+            } else {
+                format!("resumes from stage {}", rs.cached + 1)
+            };
+            eprintln!("  {:<col_pair$}  {:<col_sta$}  {}/{:<5}  {}",
+                pair.pair_id, status, rs.cached, rs.total, note);
+        }
+        eprintln!();
+        eprintln!("  Use without --dry-run to execute.");
+        return ExitCode::SUCCESS;
+    }
+
+    // ── Preflight ──
+    let pf_errors = preflight(&cfg);
+    if !pf_errors.is_empty() {
+        eprintln!("Preflight failed:");
+        for e in &pf_errors { eprintln!("  ERROR: {e}"); }
+        return ExitCode::FAILURE;
+    }
+
     let n_workers = cli.jobs.max(1).min(n_pairs);
     let state     = Arc::new(State::new(n_pairs, n_workers));
     let queue     = Arc::new(Mutex::new(pairs));
@@ -405,11 +626,11 @@ fn main() -> ExitCode {
 
     // ── Spawn workers ──
     let handles: Vec<_> = (0..n_workers).map(|slot_idx| {
-        let queue   = Arc::clone(&queue);
-        let state   = Arc::clone(&state);
-        let cfg     = Arc::clone(&cfg);
-        let dirs    = Arc::clone(&dirs);
-        let active  = Arc::clone(&active);
+        let queue  = Arc::clone(&queue);
+        let state  = Arc::clone(&state);
+        let cfg    = Arc::clone(&cfg);
+        let dirs   = Arc::clone(&dirs);
+        let active = Arc::clone(&active);
         std::thread::spawn(move || {
             loop {
                 if CANCELLED.load(Ordering::Relaxed) { break; }
@@ -458,6 +679,10 @@ fn main() -> ExitCode {
 
     for h in handles { h.join().ok(); }
 
+    // ── Write summary TSV ──
+    let results = state.pair_results.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    write_summary(&results, &output_canon);
+
     // ── Final frame ──
     let elapsed      = state.start.elapsed();
     let pairs_done   = state.pairs_done.load(Ordering::Relaxed);
@@ -470,9 +695,7 @@ fn main() -> ExitCode {
             fmt_duration(elapsed)
         );
         render_final_frame(&mut stdout, &msg);
-        // Wait up to 10s for a keypress before restoring terminal
         let _ = event::poll(Duration::from_secs(10));
-        // _guard Drop restores terminal here
     }
 
     eprintln!();
@@ -483,7 +706,8 @@ fn main() -> ExitCode {
     eprintln!(" Pairs failed    : {pairs_failed}");
     eprintln!(" Stages resumed  : {resumed} (SHA256 match → skipped)");
     eprintln!(" Total elapsed   : {}", fmt_duration(elapsed));
-    eprintln!(" Output          : {}", cfg.output_dir.display());
+    eprintln!(" Output          : {}", output_canon.display());
+    eprintln!(" Summary         : {}", output_canon.join("varscan_pipeline_summary.tsv").display());
     eprintln!("══════════════════════════════════════════════════════════════");
 
     if pairs_failed > 0 || CANCELLED.load(Ordering::Relaxed) { ExitCode::FAILURE }

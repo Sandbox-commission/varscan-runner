@@ -54,17 +54,21 @@ impl StepError {
 
 pub fn run_flagstats(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Result<(), StepError> {
     const STEP: &str = "flagstats";
+    let normal_out = dirs.flagstats.join(format!("{normal}.flagstats"));
+    let tumor_out  = dirs.flagstats.join(format!("{tumor}.flagstats"));
+    let cleanup    = || { let _ = fs::remove_file(&normal_out); let _ = fs::remove_file(&tumor_out); };
     for (sample, out_path) in [
-        (normal, dirs.flagstats.join(format!("{normal}.flagstats"))),
-        (tumor,  dirs.flagstats.join(format!("{tumor}.flagstats"))),
+        (normal, normal_out.clone()),
+        (tumor,  tumor_out.clone()),
     ] {
         let bam = cfg.bam_dir.join(format!("{sample}_final.bam"));
         let out = std::process::Command::new(&cfg.samtools)
             .arg("flagstat")
             .arg(&bam)
             .output()
-            .map_err(|e| StepError::new(STEP, format!("spawn samtools: {e}")))?;
+            .map_err(|e| { cleanup(); StepError::new(STEP, format!("spawn samtools: {e}")) })?;
         if !out.status.success() {
+            cleanup();
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(StepError::new(STEP, format!(
                 "samtools flagstat {sample}: exit={} — {}",
@@ -73,7 +77,7 @@ pub fn run_flagstats(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Re
             )));
         }
         fs::write(&out_path, &out.stdout)
-            .map_err(|e| StepError::new(STEP, format!("write {}: {e}", out_path.display())))?;
+            .map_err(|e| { cleanup(); StepError::new(STEP, format!("write {}: {e}", out_path.display())) })?;
     }
     Ok(())
 }
@@ -101,7 +105,9 @@ pub fn run_mpileup(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Resu
 
     if !status.success() {
         let _ = fs::remove_file(&out_path);
-        return Err(StepError::new(STEP, format!("samtools mpileup exit={}", status.code().unwrap_or(-1))));
+        return Err(StepError::new(STEP, format!(
+            "samtools mpileup exit={}", status.code().unwrap_or(-1)
+        )));
     }
     Ok(())
 }
@@ -136,7 +142,11 @@ pub fn run_somatic(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Resu
         .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
     if !status.success() {
-        return Err(StepError::new(STEP, format!("VarScan somatic exit={}", status.code().unwrap_or(-1))));
+        let _ = fs::remove_file(dirs.somatic.join(format!("{tumor}.snp.vcf")));
+        let _ = fs::remove_file(dirs.somatic.join(format!("{tumor}.indel.vcf")));
+        return Err(StepError::new(STEP, format!(
+            "VarScan somatic exit={}", status.code().unwrap_or(-1)
+        )));
     }
     Ok(())
 }
@@ -162,6 +172,11 @@ pub fn run_process_somatic(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(),
             .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
         if !status.success() {
+            for s in ["snp", "indel"] {
+                for cls in ["Somatic.hc", "Germline.hc", "LOH.hc"] {
+                    let _ = fs::remove_file(dirs.somatic.join(format!("{tumor}.{s}.{cls}.vcf")));
+                }
+            }
             return Err(StepError::new(STEP, format!(
                 "processSomatic ({suffix}) exit={}", status.code().unwrap_or(-1)
             )));
@@ -218,7 +233,10 @@ pub fn run_copynumber(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> R
         .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
     if !status.success() {
-        return Err(StepError::new(STEP, format!("VarScan copynumber exit={}", status.code().unwrap_or(-1))));
+        let _ = fs::remove_file(dirs.copynumber.join(format!("{tumor}.copynumber")));
+        return Err(StepError::new(STEP, format!(
+            "VarScan copynumber exit={}", status.code().unwrap_or(-1)
+        )));
     }
     Ok(())
 }
@@ -246,6 +264,8 @@ pub fn run_copycaller(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), Step
         .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
     if !status.success() {
+        let _ = fs::remove_file(dirs.copynumber.join(format!("{tumor}.copynumber.called")));
+        let _ = fs::remove_file(dirs.copynumber.join(format!("{tumor}.copynumber.homdel")));
         return Err(StepError::new(STEP, format!("copyCaller exit={}", status.code().unwrap_or(-1))));
     }
     Ok(())
@@ -282,8 +302,10 @@ pub fn run_filter_input(dirs: &Dirs, tumor: &str) -> Result<(), StepError> {
         out.push('\n');
     }
 
-    fs::write(&out_var, out.as_bytes())
-        .map_err(|e| StepError::new(STEP, format!("write VAR file: {e}")))?;
+    fs::write(&out_var, out.as_bytes()).map_err(|e| {
+        let _ = fs::remove_file(&out_var);
+        StepError::new(STEP, format!("write VAR file: {e}"))
+    })?;
     Ok(())
 }
 
@@ -318,6 +340,7 @@ pub fn run_bam_readcount(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), S
         .map_err(|e| StepError::new(STEP, format!("spawn bam-readcount: {e}")))?;
 
     if !status.success() {
+        let _ = fs::remove_file(&out_path);
         return Err(StepError::new(STEP, format!(
             "bam-readcount exit={}", status.code().unwrap_or(-1)
         )));
