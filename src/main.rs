@@ -207,6 +207,7 @@ struct State {
     pair_results:   Mutex<Vec<PairSummary>>,
     start:          Instant,
     n_pairs:        usize,
+    global_log:     Option<Mutex<fs::File>>,
 }
 
 #[derive(Clone)]
@@ -217,7 +218,7 @@ struct SlotInfo {
 }
 
 impl State {
-    fn new(n_pairs: usize, n_workers: usize) -> Self {
+    fn new(n_pairs: usize, n_workers: usize, global_log: Option<fs::File>) -> Self {
         State {
             stages_done:    AtomicUsize::new(0),
             stages_total:   n_pairs * STEPS_ORDERED.len(),
@@ -230,6 +231,7 @@ impl State {
             pair_results:   Mutex::new(Vec::with_capacity(n_pairs)),
             start:          Instant::now(),
             n_pairs,
+            global_log:     global_log.map(Mutex::new),
         }
     }
 }
@@ -239,7 +241,13 @@ fn push_event(state: &Arc<State>, msg: String) {
     let line = format!("  [{ts}] {msg}");
     let mut ev = state.events.lock().unwrap_or_else(|e| e.into_inner());
     if ev.len() >= 200 { ev.pop_front(); }
-    ev.push_back(line);
+    ev.push_back(line.clone());
+    if let Some(ref mtx) = state.global_log {
+        if let Ok(mut f) = mtx.lock() {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
+        }
+    }
 }
 
 // ─── Snapshot assembly ────────────────────────────────────────────────────────
@@ -330,12 +338,28 @@ fn process_pair(
     let mut local_run    = 0usize;
     let local_cached = resume_from;   // pre-verified stages counted upfront
 
+    // Per-sample log: append so reruns accumulate history
+    let sample_log_path = dirs.logs.join(format!("{pid}.log"));
+    let mut sample_log = fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&sample_log_path)
+        .ok();
+
+    let mut log_sample = |msg: &str| {
+        if let Some(ref mut f) = sample_log {
+            let ts = Local::now().format("%H:%M:%S");
+            let _ = f.write_all(format!("[{ts}] {msg}\n").as_bytes());
+        }
+    };
+
     // Credit pre-verified stages to global counters immediately
     for i in 0..resume_from {
         let step = STEPS_ORDERED[i];
         state.stages_done.fetch_add(1, Ordering::Relaxed);
         state.stages_resumed.fetch_add(1, Ordering::Relaxed);
-        push_event(state, format!("SKIP  {pid} — {} (pre-verified)", step_display(step)));
+        let msg = format!("SKIP  {pid} — {} (pre-verified)", step_display(step));
+        log_sample(&msg);
+        push_event(state, msg);
     }
 
     for (i, &step) in STEPS_ORDERED.iter().enumerate() {
@@ -343,6 +367,9 @@ fn process_pair(
 
         if CANCELLED.load(Ordering::Relaxed) {
             let elapsed = pair_start.elapsed().as_secs_f64();
+            let msg = format!("CANCEL {pid} — interrupted at {}", step_display(step));
+            log_sample(&msg);
+            push_event(state, msg);
             state.pair_results.lock().unwrap_or_else(|e| e.into_inner())
                 .push(PairSummary {
                     pair_id: pid.clone(), normal: n.to_string(), tumor: t.to_string(),
@@ -365,15 +392,16 @@ fn process_pair(
 
         invalidate_downstream(&cfg.output_dir, pid, step);
 
+        let step_log = dirs.logs.join(format!("{pid}.{step}.log"));
         let result: Result<(), String> = match step {
-            "flagstats"       => run_flagstats(cfg, dirs, n, t).map_err(|e| e.message),
-            "mpileup"         => run_mpileup(cfg, dirs, n, t).map_err(|e| e.message),
-            "somatic"         => run_somatic(cfg, dirs, n, t).map_err(|e| e.message),
-            "process_somatic" => run_process_somatic(cfg, dirs, t).map_err(|e| e.message),
-            "copynumber"      => run_copynumber(cfg, dirs, n, t).map_err(|e| e.message),
-            "copycaller"      => run_copycaller(cfg, dirs, t).map_err(|e| e.message),
+            "flagstats"       => run_flagstats(cfg, dirs, n, t, &step_log).map_err(|e| e.message),
+            "mpileup"         => run_mpileup(cfg, dirs, n, t, &step_log).map_err(|e| e.message),
+            "somatic"         => run_somatic(cfg, dirs, n, t, &step_log).map_err(|e| e.message),
+            "process_somatic" => run_process_somatic(cfg, dirs, t, &step_log).map_err(|e| e.message),
+            "copynumber"      => run_copynumber(cfg, dirs, n, t, &step_log).map_err(|e| e.message),
+            "copycaller"      => run_copycaller(cfg, dirs, t, &step_log).map_err(|e| e.message),
             "filter_input"    => run_filter_input(dirs, t).map_err(|e| e.message),
-            "bam_readcount"   => run_bam_readcount(cfg, dirs, t).map_err(|e| e.message),
+            "bam_readcount"   => run_bam_readcount(cfg, dirs, t, &step_log).map_err(|e| e.message),
             _                 => Err("unknown step".to_string()),
         };
 
@@ -398,10 +426,14 @@ fn process_pair(
                 }
                 state.stages_done.fetch_add(1, Ordering::Relaxed);
                 local_run += 1;
-                push_event(state, format!("DONE  {pid} — {}", step_display(step)));
+                let msg = format!("DONE  {pid} — {}", step_display(step));
+                log_sample(&msg);
+                push_event(state, msg);
             }
             Err(msg) => {
-                push_event(state, format!("FAIL  {pid} — {}: {msg}", step_display(step)));
+                let ev = format!("FAIL  {pid} — {}: {msg}", step_display(step));
+                log_sample(&ev);
+                push_event(state, ev);
                 state.pairs_failed.fetch_add(1, Ordering::Relaxed);
                 let elapsed = pair_start.elapsed().as_secs_f64();
                 state.pair_results.lock().unwrap_or_else(|e| e.into_inner())
@@ -429,7 +461,9 @@ fn process_pair(
             duration_s: elapsed,
         });
 
-    push_event(state, format!("DONE  {pid} — complete ({:.0}s)", elapsed));
+    let msg = format!("DONE  {pid} — complete ({:.0}s)", elapsed);
+    log_sample(&msg);
+    push_event(state, msg);
 
     let mut slots = state.slots.lock().unwrap_or_else(|e| e.into_inner());
     slots[slot_idx] = None;
@@ -663,8 +697,12 @@ fn main() -> ExitCode {
         (pair.clone(), from)
     }).collect();
 
-    let n_workers = cli.jobs.max(1).min(n_pairs);
-    let state     = Arc::new(State::new(n_pairs, n_workers));
+    let n_workers  = cli.jobs.max(1).min(n_pairs);
+    let global_log = fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(dirs.logs.join("varscan_runner.log"))
+        .ok();
+    let state = Arc::new(State::new(n_pairs, n_workers, global_log));
     let queue     = Arc::new(Mutex::new(annotated_pairs));
     let active    = Arc::new(AtomicUsize::new(n_workers));
 

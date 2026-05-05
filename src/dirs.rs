@@ -14,6 +14,7 @@ pub struct Dirs {
     pub readcount:    PathBuf,
     pub filter_input: PathBuf,
     pub filtered:     PathBuf,
+    pub logs:         PathBuf,
 }
 
 impl Dirs {
@@ -27,6 +28,7 @@ impl Dirs {
             readcount:    base.join("readcount"),
             filter_input: base.join("filter-input"),
             filtered:     base.join("filtered"),
+            logs:         base.join("logs"),
         }
     }
 
@@ -40,6 +42,7 @@ impl Dirs {
             &self.readcount,
             &self.filter_input,
             &self.filtered,
+            &self.logs,
         ] {
             fs::create_dir_all(dir)?;
         }

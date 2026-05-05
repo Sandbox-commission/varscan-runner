@@ -1,6 +1,6 @@
 use crate::dirs::Dirs;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -52,7 +52,7 @@ impl StepError {
 
 // ─── Stage 1: samtools flagstat ────────────────────────────────────────────────
 
-pub fn run_flagstats(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Result<(), StepError> {
+pub fn run_flagstats(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "flagstats";
     let normal_out = dirs.flagstats.join(format!("{normal}.flagstats"));
     let tumor_out  = dirs.flagstats.join(format!("{tumor}.flagstats"));
@@ -67,6 +67,11 @@ pub fn run_flagstats(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Re
             .arg(&bam)
             .output()
             .map_err(|e| { cleanup(); StepError::new(STEP, format!("spawn samtools: {e}")) })?;
+        if !out.stderr.is_empty() {
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+                let _ = f.write_all(&out.stderr);
+            }
+        }
         if !out.status.success() {
             cleanup();
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -84,13 +89,15 @@ pub fn run_flagstats(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Re
 
 // ─── Stage 2: samtools mpileup ────────────────────────────────────────────────
 
-pub fn run_mpileup(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Result<(), StepError> {
+pub fn run_mpileup(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "mpileup";
     let out_path    = dirs.mpileup.join(format!("{normal}_{tumor}.mpileup"));
     let normal_bam  = cfg.bam_dir.join(format!("{normal}_final.bam"));
     let tumor_bam   = cfg.bam_dir.join(format!("{tumor}_final.bam"));
     let out_file    = fs::File::create(&out_path)
         .map_err(|e| StepError::new(STEP, format!("create {}: {e}", out_path.display())))?;
+    let log_file = fs::OpenOptions::new().create(true).append(true).open(log)
+        .map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
     let status = std::process::Command::new(&cfg.samtools)
         .args(["mpileup", "-B"])
@@ -99,7 +106,7 @@ pub fn run_mpileup(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Resu
         .arg(&normal_bam)
         .arg(&tumor_bam)
         .stdout(out_file)
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .status()
         .map_err(|e| StepError::new(STEP, format!("spawn samtools: {e}")))?;
 
@@ -114,10 +121,12 @@ pub fn run_mpileup(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Resu
 
 // ─── Stage 3: VarScan somatic ─────────────────────────────────────────────────
 
-pub fn run_somatic(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Result<(), StepError> {
+pub fn run_somatic(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "somatic";
     let mpileup    = dirs.mpileup.join(format!("{normal}_{tumor}.mpileup"));
     let out_prefix = dirs.somatic.join(tumor);
+    let log_file = fs::OpenOptions::new().create(true).append(true).open(log)
+        .map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
     let status = std::process::Command::new(&cfg.java)
         .arg(format!("-Xmx{}", cfg.java_mem))
@@ -137,7 +146,7 @@ pub fn run_somatic(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Resu
         .arg("--somatic-p-value").arg(cfg.somatic_p_value.to_string())
         .arg("--strand-filter").arg("1")
         .arg("--output-vcf").arg("1")
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .status()
         .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
@@ -153,11 +162,14 @@ pub fn run_somatic(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Resu
 
 // ─── Stage 4: VarScan processSomatic ─────────────────────────────────────────
 
-pub fn run_process_somatic(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), StepError> {
+pub fn run_process_somatic(cfg: &Config, dirs: &Dirs, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "process_somatic";
     for suffix in ["snp.vcf", "indel.vcf"] {
         let vcf = dirs.somatic.join(format!("{tumor}.{suffix}"));
         if !vcf.exists() { continue; }
+
+        let log_file = fs::OpenOptions::new().create(true).append(true).open(log)
+            .map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
         let status = std::process::Command::new(&cfg.java)
             .arg(format!("-Xmx{}", cfg.java_mem))
@@ -167,7 +179,7 @@ pub fn run_process_somatic(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(),
             .arg("--min-tumor-freq").arg(cfg.min_tumor_freq.to_string())
             .arg("--max-normal-freq").arg(cfg.max_normal_freq.to_string())
             .arg("--p-value").arg(cfg.process_p_value.to_string())
-            .stderr(Stdio::null())
+            .stderr(log_file)
             .status()
             .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
@@ -210,11 +222,13 @@ pub fn compute_data_ratio(dirs: &Dirs, normal: &str, tumor: &str) -> f64 {
 
 // ─── Stage 5: VarScan copynumber ─────────────────────────────────────────────
 
-pub fn run_copynumber(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> Result<(), StepError> {
+pub fn run_copynumber(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "copynumber";
     let mpileup    = dirs.mpileup.join(format!("{normal}_{tumor}.mpileup"));
     let out_prefix = dirs.copynumber.join(tumor);
     let ratio      = compute_data_ratio(dirs, normal, tumor);
+    let log_file = fs::OpenOptions::new().create(true).append(true).open(log)
+        .map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
     let status = std::process::Command::new(&cfg.java)
         .arg(format!("-Xmx{}", cfg.java_mem))
@@ -228,7 +242,7 @@ pub fn run_copynumber(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> R
         .arg("--max-segment-size").arg(cfg.max_segment_size.to_string())
         .arg("--p-value").arg(cfg.cnv_p_value.to_string())
         .arg("--data-ratio").arg(format!("{ratio:.6}"))
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .status()
         .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
@@ -243,12 +257,14 @@ pub fn run_copynumber(cfg: &Config, dirs: &Dirs, normal: &str, tumor: &str) -> R
 
 // ─── Stage 6: VarScan copyCaller ─────────────────────────────────────────────
 
-pub fn run_copycaller(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), StepError> {
+pub fn run_copycaller(cfg: &Config, dirs: &Dirs, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "copycaller";
     let cnv = dirs.copynumber.join(format!("{tumor}.copynumber"));
     if !cnv.exists() {
         return Err(StepError::new(STEP, format!("{} not found — copynumber step may have failed", cnv.display())));
     }
+    let log_file = fs::OpenOptions::new().create(true).append(true).open(log)
+        .map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
     let status = std::process::Command::new(&cfg.java)
         .arg(format!("-Xmx{}", cfg.java_mem))
@@ -259,7 +275,7 @@ pub fn run_copycaller(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), Step
             .arg(dirs.copynumber.join(format!("{tumor}.copynumber.called")))
         .arg("--output-homdel-file")
             .arg(dirs.copynumber.join(format!("{tumor}.copynumber.homdel")))
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .status()
         .map_err(|e| StepError::new(STEP, format!("spawn java: {e}")))?;
 
@@ -311,7 +327,7 @@ pub fn run_filter_input(dirs: &Dirs, tumor: &str) -> Result<(), StepError> {
 
 // ─── Stage 8: bam-readcount ───────────────────────────────────────────────────
 
-pub fn run_bam_readcount(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), StepError> {
+pub fn run_bam_readcount(cfg: &Config, dirs: &Dirs, tumor: &str, log: &Path) -> Result<(), StepError> {
     const STEP: &str = "bam_readcount";
     let var_file = dirs.filter_input.join(format!("{tumor}.snp.Somatic.hc.var"));
     let out_path = dirs.readcount.join(format!("{tumor}.snp.Somatic.hc.readcount"));
@@ -327,6 +343,8 @@ pub fn run_bam_readcount(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), S
     let tumor_bam = cfg.bam_dir.join(format!("{tumor}_final.bam"));
     let out_file  = fs::File::create(&out_path)
         .map_err(|e| StepError::new(STEP, format!("create readcount output: {e}")))?;
+    let log_file = fs::OpenOptions::new().create(true).append(true).open(log)
+        .map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
     let status = std::process::Command::new(&cfg.bam_readcount_bin)
         .arg("-q").arg("1")
@@ -335,7 +353,7 @@ pub fn run_bam_readcount(cfg: &Config, dirs: &Dirs, tumor: &str) -> Result<(), S
         .arg("-l").arg(&var_file)
         .arg(&tumor_bam)
         .stdout(out_file)
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .status()
         .map_err(|e| StepError::new(STEP, format!("spawn bam-readcount: {e}")))?;
 
